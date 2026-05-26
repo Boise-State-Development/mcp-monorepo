@@ -1,0 +1,254 @@
+name: Deploy MCP Servers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**'
+      - 'infrastructure/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      server:
+        description: 'Server to deploy (or "all" or "infrastructure-only")'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - infrastructure-only
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: us-west-2
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      servers: ${{ steps.changes.outputs.servers }}
+      deploy_shared: ${{ steps.changes.outputs.deploy_shared }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed servers
+        id: changes
+        run: |
+          # Helper function to get all server directories
+          get_all_servers() {
+            ls -d packages/*/ 2>/dev/null | xargs -n1 basename | jq -R -s -c 'split("\n") | map(select(length > 0))'
+          }
+
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "${{ inputs.server }}" == "all" ]; then
+              SERVERS=$(get_all_servers)
+              if [ "$SERVERS" == "[]" ]; then
+                SERVERS='[]'
+              fi
+              echo "servers=$SERVERS" >> $GITHUB_OUTPUT
+              echo "deploy_shared=true" >> $GITHUB_OUTPUT
+            elif [ "${{ inputs.server }}" == "infrastructure-only" ]; then
+              echo 'servers=[]' >> $GITHUB_OUTPUT
+              echo "deploy_shared=true" >> $GITHUB_OUTPUT
+            else
+              echo 'servers=["${{ inputs.server }}"]' >> $GITHUB_OUTPUT
+              echo "deploy_shared=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Detect which packages changed
+            CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+
+            # Get changed server packages
+            CHANGED_SERVERS=$(echo "$CHANGED_FILES" | \
+              grep '^packages/' | \
+              cut -d'/' -f2 | \
+              sort -u | \
+              jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+            # Categorize infrastructure changes:
+            # - infrastructure/lib/** are shared CDK constructs used by every
+            #   stack — any change there forces a deploy of all servers.
+            # - infrastructure/bin/app.ts only registers stacks. Adding a new
+            #   server (the common case) touches it alongside packages/{new}/,
+            #   and we should NOT redeploy every existing server for that.
+            SHARED_INFRA_CHANGED=false
+            ANY_INFRA_CHANGED=false
+            if echo "$CHANGED_FILES" | grep -qE '^infrastructure/lib/'; then
+              SHARED_INFRA_CHANGED=true
+            fi
+            if echo "$CHANGED_FILES" | grep -qE '^infrastructure/'; then
+              ANY_INFRA_CHANGED=true
+            fi
+
+            if [ "$SHARED_INFRA_CHANGED" == "true" ]; then
+              # Shared construct changes affect every server stack.
+              SERVERS=$(get_all_servers)
+              if [ "$SERVERS" == "[]" ]; then
+                SERVERS='[]'
+              fi
+              echo "servers=$SERVERS" >> $GITHUB_OUTPUT
+              echo "deploy_shared=true" >> $GITHUB_OUTPUT
+            elif [ "$CHANGED_SERVERS" == "[]" ] || [ -z "$CHANGED_SERVERS" ]; then
+              # No packages changed.
+              if [ "$ANY_INFRA_CHANGED" == "true" ]; then
+                # bin/app.ts (or other non-lib infra) changed without any
+                # package change — likely an env var tweak on an existing
+                # stack. Redeploy all to be safe.
+                SERVERS=$(get_all_servers)
+                if [ "$SERVERS" == "[]" ]; then
+                  SERVERS='[]'
+                fi
+                echo "servers=$SERVERS" >> $GITHUB_OUTPUT
+                echo "deploy_shared=true" >> $GITHUB_OUTPUT
+              else
+                echo 'servers=[]' >> $GITHUB_OUTPUT
+                echo "deploy_shared=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              # Packages changed (with or without bin/app.ts changes — e.g.
+              # new-server registration). Deploy only the changed packages.
+              echo "servers=$CHANGED_SERVERS" >> $GITHUB_OUTPUT
+              echo "deploy_shared=$ANY_INFRA_CHANGED" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  deploy-shared:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.deploy_shared == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build infrastructure
+        run: npm run build --workspace=infrastructure
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy shared stack
+        env:
+          STAGE: ${{ inputs.environment || 'dev' }}
+        run: |
+          cd infrastructure
+          npx cdk deploy McpShared-${STAGE} \
+            -c stage=${STAGE} \
+            --require-approval never \
+            --outputs-file shared-outputs.json
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: shared-outputs
+          path: infrastructure/shared-outputs.json
+
+  deploy-servers:
+    needs: [detect-changes, deploy-shared]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.servers != '[]' &&
+      (needs.deploy-shared.result == 'success' || needs.deploy-shared.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.detect-changes.outputs.servers) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build infrastructure
+        run: npm run build --workspace=infrastructure
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names mcp-${{ matrix.server }} 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name mcp-${{ matrix.server }} \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256
+
+      - name: Build Docker image
+        run: |
+          cd packages/${{ matrix.server }}
+          docker build --provenance=false --platform linux/amd64 -t mcp-${{ matrix.server }}:latest .
+
+      - name: Tag and push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag mcp-${{ matrix.server }}:latest $ECR_REGISTRY/mcp-${{ matrix.server }}:latest
+          docker tag mcp-${{ matrix.server }}:latest $ECR_REGISTRY/mcp-${{ matrix.server }}:${{ github.sha }}
+          docker push $ECR_REGISTRY/mcp-${{ matrix.server }}:latest
+          docker push $ECR_REGISTRY/mcp-${{ matrix.server }}:${{ github.sha }}
+
+      - name: Deploy server stack
+        env:
+          STAGE: ${{ inputs.environment || 'dev' }}
+          # Use git SHA as image tag so CloudFormation always updates Lambda code
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd infrastructure
+          npx cdk deploy McpServer-${{ matrix.server }}-${STAGE} \
+            -c stage=${STAGE} \
+            --require-approval never \
+            --outputs-file ${{ matrix.server }}-outputs.json
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.server }}-outputs
+          path: infrastructure/${{ matrix.server }}-outputs.json
