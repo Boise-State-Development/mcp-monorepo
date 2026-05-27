@@ -1,0 +1,32 @@
+{
+  "name": "mcp-monorepo",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Monorepo for MCP servers",
+  "workspaces": [
+    "packages/*",
+    "infrastructure"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present",
+    "deploy:all": "cd infrastructure && npx cdk deploy --all",
+    "synth": "cd infrastructure && npx cdk synth"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Boise-State-Development/mcp-monorepo.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "aws",
+    "lambda"
+  ],
+  "license": "MIT"
+}
